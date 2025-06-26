@@ -2,6 +2,7 @@ import os
 import asyncio
 import re
 import logging
+import gc
 from concurrent.futures import ThreadPoolExecutor
 
 import camelot
@@ -55,10 +56,12 @@ async def extraire_pdf_vers_excel_async(pdf_path, keywords, num_header_rows):
     # Ghost tables to be removed if size lower than :
     min_rows, min_cols = 3, 4
 
-    all_tables = []
     pages_sans_tableaux = []
 
     progress_count, total_count = 0, len(target_pages)
+
+    output_buffer: BinaryIO = BytesIO()
+    writer = pd.ExcelWriter(output_buffer, engine='xlsxwriter')
 
     for page, keyword in target_pages:
         print(f"📄 Traitement de la page {page} - Type : {keyword}")
@@ -161,7 +164,9 @@ async def extraire_pdf_vers_excel_async(pdf_path, keywords, num_header_rows):
 
                 df_clean.reset_index(drop=True, inplace=True)
 
-                all_tables.append((sheet_name, df_clean))
+                df_clean.to_excel(writer, sheet_name=sheet_name, index=False)
+                del df_clean
+                gc.collect()
             else:
                 print(f"🚫 Aucune ligne de données trouvée - Page {page} Table {i + 1}")
                 pages_sans_tableaux.append((int(page), keyword))
@@ -170,12 +175,10 @@ async def extraire_pdf_vers_excel_async(pdf_path, keywords, num_header_rows):
         progress.progress_state["progress_count"] = progress_count
         progress.progress_state["total_count"] = total_count
         print(f"Progression: {progress_count}/{total_count}")
+        del tables
+        gc.collect()
 
-    output_buffer: BinaryIO = BytesIO()
-    with pd.ExcelWriter(output_buffer, engine='xlsxwriter') as writer:
-        for sheet_name, df in all_tables:
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
-
+    writer.close()
     output_buffer.seek(0)
     return output_buffer
 
