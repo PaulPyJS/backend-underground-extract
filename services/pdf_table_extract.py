@@ -44,6 +44,12 @@ async def extraire_pdf_vers_excel_async(pdf_path, keywords, num_header_rows):
                 break
 
     print(f"🔍 Pages retenues : {target_pages}")
+
+    if not target_pages:
+        print("🚫 Aucun mot-clé trouvé dans le document, extraction annulée.")
+        progress.progress_state["progress_count"] = 1
+        return BytesIO()
+
     progress.progress_state["total_count"] = max(len(target_pages), 1)
 
     # Ghost tables to be removed if size lower than :
