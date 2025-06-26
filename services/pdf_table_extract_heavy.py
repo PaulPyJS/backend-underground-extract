@@ -44,7 +44,7 @@ async def extraire_pdf_vers_excel_async(pdf_path, keywords, num_header_rows):
             if kw.lower() in text:
                 target_pages.append((str(i + 1), kw))
                 break
-
+                
     doc.close()
     del doc
     gc.collect()
@@ -69,50 +69,61 @@ async def extraire_pdf_vers_excel_async(pdf_path, keywords, num_header_rows):
 
     for page, keyword in target_pages:
         print(f"📄 Traitement de la page {page} - Type : {keyword}")
-        print("🧪 Lecture Camelot (stream)...")
-        try:
-            try:
-                tables = await asyncio.to_thread(
-                    camelot.read_pdf,
-                    pdf_path,
-                    pages=page,
-                    flavor="stream",
-                    strip_text="\n"
-                )
-            except Exception as e:
-                print(f"❌ Erreur Camelot stream sur la page {page} : {e}")
-                continue
 
-            print(f"📊 Tables détectées (stream): {len(tables)}")
-            for i, t in enumerate(tables):
-                print(f" → Table {i + 1} shape: {t.df.shape}")
+        # Using multiple option to detect tables
+        # Try LATTICE
+        print("🧪 Lecture Camelot (lattice)...")
+        tables = await asyncio.to_thread(
+        camelot.read_pdf,
+      pdf_path,
+            pages=page,
+            flavor="lattice",
+            line_scale=40,
+            shift_text=["", ""],
+            copy_text=["v"]
+        )
+        print(f"📊 Tables détectées (mode lattice): {len(tables)}")
+        for i, t in enumerate(tables):
+            print(f" → Table {i + 1} shape: {t.df.shape}")
 
+        valid_tables = [t for t in tables if t.df.shape[0] >= min_rows and t.df.shape[1] >= min_cols]
+
+        # Try STREAM -- only if LATTICE not valid
+        if not valid_tables:
+            print(f"⚠️ Re-tentative avec flavor=stream sur la page {page}")
+            tables = await asyncio.to_thread(
+            camelot.read_pdf,
+                pdf_path,
+                pages=page,
+                flavor="stream",
+                strip_text="\n"
+            )
+            print(f"📊 Tables détectées (mode stream): {len(tables)}")
             valid_tables = [t for t in tables if t.df.shape[0] >= min_rows and t.df.shape[1] >= min_cols]
 
-            if valid_tables:
-                tables = sorted(valid_tables, key=lambda t: t.df.shape[0] * t.df.shape[1], reverse=True)[:1]
-            else:
-                print(f"⚠️ Aucun tableau valide détecté sur la page {page}")
-                pages_sans_tableaux.append((int(page), keyword))
-                continue
+        if not valid_tables:
+            print(f"⚠️ Aucun tableau valide détecté sur la page {page}")
+            pages_sans_tableaux.append((int(page), keyword))
+        else:
+            tables = valid_tables
 
-        except Exception as e:
-            print(f"❌ Erreur inattendue sur la page {page} : {e}")
-            continue
 
         for i, table in enumerate(tables):
             raw_table = table.df.values.tolist()
+
+            # Normalize the table to make sure every row got the same columns number :
+            #   To keep blanks
             expected_cols = max(len(row) for row in raw_table)
             normalized = [
                 row + [""] * (expected_cols - len(row)) if len(row) < expected_cols else row
                 for row in raw_table
             ]
-            df = pd.DataFrame(normalized)
 
+            df = pd.DataFrame(normalized)
             if df.shape[0] < min_rows or df.shape[1] < min_cols:
-                print(
-                    f"🚫 Tableau ignoré (trop petit) - Page {page} Table {i + 1} ({df.shape[0]} lignes, {df.shape[1]} colonnes)")
+                print(f"🚫 Tableau ignoré (trop petit) - Page {page} Table {i+1} ({df.shape[0]} lignes, {df.shape[1]} colonnes)")
                 continue
+
 
             data_start_idx = None
             for idx, row in df.iterrows():
@@ -128,12 +139,16 @@ async def extraire_pdf_vers_excel_async(pdf_path, keywords, num_header_rows):
                     (row[0] and all(str(cell).strip() == "" for cell in row[1:]))
                     for row in df_clean.values
                 )
+
                 if has_group_lines:
                     df_clean = df_clean[~((df_clean[0].notna()) & (df_clean.iloc[:, 1:].isna().all(axis=1)))]
 
                 df_clean = df_clean.replace(r'\n', ' ', regex=True)
 
+
+
                 header_rows = df.iloc[:num_header_rows].values.tolist()
+
                 fused_headers = []
                 for col_idx in range(df.shape[1]):
                     parts = []
@@ -145,14 +160,15 @@ async def extraire_pdf_vers_excel_async(pdf_path, keywords, num_header_rows):
                     header = " ".join(parts).strip()
                     fused_headers.append(header if header else f"col_{col_idx}")
 
+
                 if any(h.startswith("col_") is False for h in fused_headers):
                     df_clean.columns = fused_headers
                 else:
                     df_clean.columns = [f"col_{j}" for j in range(df_clean.shape[1])]
 
                 df_clean.reset_index(drop=True, inplace=True)
-                df_clean.to_excel(writer, sheet_name=sheet_name, index=False)
 
+                df_clean.to_excel(writer, sheet_name=sheet_name, index=False)
                 del df_clean
                 gc.collect()
             else:
