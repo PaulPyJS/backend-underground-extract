@@ -25,8 +25,9 @@ app.add_middleware(
 )
 
 
-from routes import extract_geochem
+from routes import extract_geochem, extract_geotech
 app.include_router(extract_geochem.router)
+app.include_router(extract_geotech.router)
 
 
 
