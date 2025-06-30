@@ -10,6 +10,7 @@ import statistics
 from decimal import Decimal, getcontext
 
 import progress
+import asyncio
 import traceback
 
 getcontext().prec = 10
