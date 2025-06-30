@@ -138,7 +138,7 @@ async def extract_pdf(
         return JSONResponse(content={"error": f"Mauvais format de keywords: {e}"}, status_code=400)
 
     new_task = asyncio.create_task(
-        extraction_worker(pdf_path, keywords, num_header_rows, custom_name, pdf.filename)
+        pdf_extraction_worker(pdf_path, keywords, num_header_rows, custom_name, pdf.filename)
     )
     progress.progress_state["current_task"] = new_task
     progress.progress_state["is_running"] = True
@@ -146,7 +146,8 @@ async def extract_pdf(
     print("✅ Nouvelle tâche lancée")
     return JSONResponse(content={"status": "started"}, status_code=202)
 
-async def extraction_worker(pdf_path, keywords, num_header_rows, custom_name, original_filename):
+
+async def pdf_extraction_worker(pdf_path, keywords, num_header_rows, custom_name, original_filename):
     try:
         output_buffer = await extraire_pdf_vers_excel_async(pdf_path, keywords, num_header_rows)
 

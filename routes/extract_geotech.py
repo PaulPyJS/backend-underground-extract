@@ -9,6 +9,7 @@ import json
 import statistics
 from decimal import Decimal, getcontext
 
+import progress
 import traceback
 
 getcontext().prec = 10
@@ -98,42 +99,66 @@ def generate_depths_from_config(config):
     p = float(config['step'])
     return [round(s + i * p, 3) for i in range(int((e - s) / p + 1))]
 
-@router.post("/extract-sondage")
-async def extract_sondages(pdf: UploadFile = File(...)):
+
+
+# === Worker extraction pressio ===
+async def extract_pressio_worker(pdf_bytes):
     try:
-        content = await pdf.read()
-        with pdfplumber.open(io.BytesIO(content)) as doc:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+            pages = doc.pages
+            total = len(pages)
+            progress.progress_state["progress"] = 0
+            progress.progress_state["total"] = total
+            progress.progress_state["is_running"] = True
+
             sondages = set()
             pattern = re.compile(r"\bSP\d{1,4}\b", re.IGNORECASE)
-            for page in doc.pages:
+            # BASIC PATTERN SPXXXX From SP1 to SP9999 possible, to be modified to let user choose
+
+            for i, page in enumerate(pages):
                 words = page.extract_words()
                 for word in words:
                     txt = word.get("text", "").strip()
                     if pattern.fullmatch(txt):
                         sondages.add(txt)
-        return {"sondages": sorted(sondages)}
+
+                progress.progress_state["progress"] = i + 1
+                await asyncio.sleep(0)
+
+            progress.progress_state["is_running"] = False
+            progress.progress_state["last_output_file"] = None
+
+            return {"sondages": sorted(sondages)}
+
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        progress.progress_state["is_running"] = False
+        progress.progress_state["last_output_file"] = None
+        raise e
 
 
-@router.post("/process-sondage")
-async def run_pdf_sondage_extract(pdf: UploadFile = File(...), config: str = Form(...)):
+# === Worker process pressio ===
+async def process_pressio_worker(pdf_bytes, config_data):
     try:
-        config_data = json.loads(config)
-        mode = config_data['mode']
-        depth_config = config_data['config']
-        sondages = config_data['sondages']
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+            pages = doc.pages
+            total = len(pages)
+            progress.progress_state["progress"] = 0
+            progress.progress_state["total"] = total
+            progress.progress_state["is_running"] = True
 
-        content = await pdf.read()
-        keywords = ["Pf*", "Pl*", "Module"]
+            mode = config_data['mode']
+            depth_config = config_data['config']
+            sondages = config_data['sondages']
+            keywords = ["Pf*", "Pl*", "Module"]
 
-        final_data = {}
+            final_data = {}
 
-        with pdfplumber.open(io.BytesIO(content)) as doc:
-            for page in doc.pages:
+            for i, page in enumerate(pages):
                 words = page.extract_words()
                 sondage_name = detect_sondage_name(words) or f"Page {page.page_number}"
                 if sondage_name not in sondages:
+                    progress.progress_state["progress"] = i + 1
+                    await asyncio.sleep(0)
                     continue
 
                 # Détection des positions
@@ -152,15 +177,17 @@ async def run_pdf_sondage_extract(pdf: UploadFile = File(...), config: str = For
                     pf_final, pl_final = [], []
                     pf_vals = values_by_keyword["Pf*"]
                     if len(pf_vals) % 2 != 0:
+                        progress.progress_state["progress"] = i + 1
+                        await asyncio.sleep(0)
                         continue
-                    for i in range(len(pf_vals) - 2, -1, -2):
-                        a, b = pf_vals[i][1], pf_vals[i + 1][1]
+                    for idx in range(len(pf_vals) - 2, -1, -2):
+                        a, b = pf_vals[idx][1], pf_vals[idx + 1][1]
                         if a < b:
-                            pf_final.append((pf_vals[i][0], a))
-                            pl_final.append((pf_vals[i + 1][0], b))
+                            pf_final.append((pf_vals[idx][0], a))
+                            pl_final.append((pf_vals[idx + 1][0], b))
                         else:
-                            pf_final.append((pf_vals[i + 1][0], b))
-                            pl_final.append((pf_vals[i][0], a))
+                            pf_final.append((pf_vals[idx + 1][0], b))
+                            pl_final.append((pf_vals[idx][0], a))
                     pf_final.reverse()
                     pl_final.reverse()
                 else:
@@ -173,11 +200,12 @@ async def run_pdf_sondage_extract(pdf: UploadFile = File(...), config: str = For
                 pl_list, pl_red = detect_y_anomalies(pl_final, "Pl*")
                 em_list, em_red = detect_y_anomalies(em_final, "Module")
 
-                # Profondeur
                 if mode == "global":
                     depths = generate_depths_from_config(depth_config)
                 else:
                     if sondage_name not in depth_config:
+                        progress.progress_state["progress"] = i + 1
+                        await asyncio.sleep(0)
                         continue
                     depths = generate_depths_from_config(depth_config[sondage_name])
 
@@ -204,14 +232,61 @@ async def run_pdf_sondage_extract(pdf: UploadFile = File(...), config: str = For
                 final_data[sondage_name]["RedFlags"]["Pl*"] += pl_red
                 final_data[sondage_name]["RedFlags"]["Module"] += em_red
 
-        return final_data
+                progress.progress_state["progress"] = i + 1
+                await asyncio.sleep(0)
+
+            progress.progress_state["is_running"] = False
+            progress.progress_state["last_output_file"] = None
+
+            return final_data
 
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        progress.progress_state["is_running"] = False
+        progress.progress_state["last_output_file"] = None
+        raise e
 
 
-@router.post("/export-geotech")
-async def export_geotech(validated_data: dict):
+
+
+@router.post("/extract-pressio")
+async def extract_pressio(pdf: UploadFile = File(...)):
+    current_task = progress.progress_state.get("current_task")
+    if progress.progress_state.get("is_running") and current_task and not current_task.done():
+        current_task.cancel()
+        try:
+            await current_task
+        except asyncio.CancelledError:
+            pass
+
+    content = await pdf.read()
+    task = asyncio.create_task(extract_pressio_worker(content))
+    progress.progress_state["current_task"] = task
+    progress.progress_state["is_running"] = True
+    result = await task
+    return result
+
+
+@router.post("/process-pressio")
+async def process_pressio(pdf: UploadFile = File(...), config: str = Form(...)):
+    current_task = progress.progress_state.get("current_task")
+    if progress.progress_state.get("is_running") and current_task and not current_task.done():
+        current_task.cancel()
+        try:
+            await current_task
+        except asyncio.CancelledError:
+            pass
+
+    content = await pdf.read()
+    config_data = json.loads(config)
+    task = asyncio.create_task(process_pressio_worker(content, config_data))
+    progress.progress_state["current_task"] = task
+    progress.progress_state["is_running"] = True
+    result = await task
+    return result
+
+
+@router.post("/export-pressio")
+async def export_pressio(validated_data: dict):
     try:
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -255,3 +330,131 @@ async def export_geotech(validated_data: dict):
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#
+# @router.post("/extract-pressio")
+# async def extract_pressio(pdf: UploadFile = File(...)):
+#     try:
+#         content = await pdf.read()
+#         with pdfplumber.open(io.BytesIO(content)) as doc:
+#             sondages = set()
+#             pattern = re.compile(r"\bSP\d{1,4}\b", re.IGNORECASE)
+#             for page in doc.pages:
+#                 words = page.extract_words()
+#                 for word in words:
+#                     txt = word.get("text", "").strip()
+#                     if pattern.fullmatch(txt):
+#                         sondages.add(txt)
+#         return {"sondages": sorted(sondages)}
+#     except Exception as e:
+#         return JSONResponse(status_code=500, content={"error": str(e)})
+#
+#
+# @router.post("/process-pressio")
+# async def run_pdf_pressio_extract(pdf: UploadFile = File(...), config: str = Form(...)):
+#     try:
+#         config_data = json.loads(config)
+#         mode = config_data['mode']
+#         depth_config = config_data['config']
+#         sondages = config_data['sondages']
+#
+#         content = await pdf.read()
+#         keywords = ["Pf*", "Pl*", "Module"]
+#
+#         final_data = {}
+#
+#         with pdfplumber.open(io.BytesIO(content)) as doc:
+#             for page in doc.pages:
+#                 words = page.extract_words()
+#                 sondage_name = detect_sondage_name(words) or f"Page {page.page_number}"
+#                 if sondage_name not in sondages:
+#                     continue
+#
+#                 # Détection des positions
+#                 x_positions = get_keyword_x_positions(words, keywords)
+#                 is_combined = False
+#                 if "Pf*" in x_positions and "Pl*" in x_positions:
+#                     distance = abs(x_positions["Pf*"] - x_positions["Pl*"])
+#                     if distance <= 15:
+#                         is_combined = True
+#
+#                 values_by_keyword = {k: extract_values_near_keyword(words, k, {
+#                     "left": 10, "right": 30 if k != "Module" else 54, "min_dy": 50
+#                 }) for k in keywords}
+#
+#                 if is_combined:
+#                     pf_final, pl_final = [], []
+#                     pf_vals = values_by_keyword["Pf*"]
+#                     if len(pf_vals) % 2 != 0:
+#                         continue
+#                     for i in range(len(pf_vals) - 2, -1, -2):
+#                         a, b = pf_vals[i][1], pf_vals[i + 1][1]
+#                         if a < b:
+#                             pf_final.append((pf_vals[i][0], a))
+#                             pl_final.append((pf_vals[i + 1][0], b))
+#                         else:
+#                             pf_final.append((pf_vals[i + 1][0], b))
+#                             pl_final.append((pf_vals[i][0], a))
+#                     pf_final.reverse()
+#                     pl_final.reverse()
+#                 else:
+#                     pf_final = values_by_keyword["Pf*"]
+#                     pl_final = values_by_keyword["Pl*"]
+#
+#                 em_final = values_by_keyword["Module"]
+#
+#                 pf_list, pf_red = detect_y_anomalies(pf_final, "Pf*")
+#                 pl_list, pl_red = detect_y_anomalies(pl_final, "Pl*")
+#                 em_list, em_red = detect_y_anomalies(em_final, "Module")
+#
+#                 # Profondeur
+#                 if mode == "global":
+#                     depths = generate_depths_from_config(depth_config)
+#                 else:
+#                     if sondage_name not in depth_config:
+#                         continue
+#                     depths = generate_depths_from_config(depth_config[sondage_name])
+#
+#                 if sondage_name not in final_data:
+#                     final_data[sondage_name] = {
+#                         "Depth": [],
+#                         "Pf*": [],
+#                         "Pl*": [],
+#                         "Module": [],
+#                         "RedFlags": {
+#                             "Pf*": [],
+#                             "Pl*": [],
+#                             "Module": []
+#                         }
+#                     }
+#
+#                 if not final_data[sondage_name]["Depth"]:
+#                     final_data[sondage_name]["Depth"] = depths
+#
+#                 final_data[sondage_name]["Pf*"] += pf_list
+#                 final_data[sondage_name]["Pl*"] += pl_list
+#                 final_data[sondage_name]["Module"] += em_list
+#                 final_data[sondage_name]["RedFlags"]["Pf*"] += pf_red
+#                 final_data[sondage_name]["RedFlags"]["Pl*"] += pl_red
+#                 final_data[sondage_name]["RedFlags"]["Module"] += em_red
+#
+#         return final_data
+#
+#     except Exception as e:
+#         return JSONResponse(status_code=500, content={"error": str(e)})
