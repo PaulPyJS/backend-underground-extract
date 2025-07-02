@@ -94,6 +94,8 @@ async def reset_progress():
     progress.progress_state["progress_count"] = 0
     progress.progress_state["total_count"] = 1
     progress.progress_state["last_output_file"] = None
+    progress.progress_state["is_running"] = False
+    progress.progress_state["current_task"] = None
     return {"status": "reset"}
 
 

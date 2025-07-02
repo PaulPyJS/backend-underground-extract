@@ -50,7 +50,7 @@ def detect_y_anomalies(y_val_list, keyword):
     return output, red_flags
 
 
-def detect_sondage_name(words):
+def detect_pressio_name(words):
     pattern = re.compile(r"\bSP\d{1,4}\b")
     for w in words:
         text = w.get('text', '')
@@ -101,18 +101,18 @@ def generate_depths_from_config(config):
     return [round(s + i * p, 3) for i in range(int((e - s) / p + 1))]
 
 
+# EXTRACTION PRESSIOMETRE
 
-# === Worker extraction pressio ===
 async def extract_pressio_worker(pdf_bytes):
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
             pages = doc.pages
             total = len(pages)
-            progress.progress_state["progress"] = 0
-            progress.progress_state["total"] = total
+            progress.progress_state["progress_count"] = 0
+            progress.progress_state["total_count"] = total
             progress.progress_state["is_running"] = True
 
-            sondages = set()
+            pressio = set()
             pattern = re.compile(r"\bSP\d{1,4}\b", re.IGNORECASE)
             # BASIC PATTERN SPXXXX From SP1 to SP9999 possible, to be modified to let user choose
 
@@ -121,44 +121,68 @@ async def extract_pressio_worker(pdf_bytes):
                 for word in words:
                     txt = word.get("text", "").strip()
                     if pattern.fullmatch(txt):
-                        sondages.add(txt)
+                        pressio.add(txt)
 
-                progress.progress_state["progress"] = i + 1
+                progress.progress_state["progress_count"] = i + 1
                 await asyncio.sleep(0)
 
             progress.progress_state["is_running"] = False
             progress.progress_state["last_output_file"] = None
 
-            return {"sondages": sorted(sondages)}
+            return {"pressio": sorted(pressio)}
 
     except Exception as e:
         progress.progress_state["is_running"] = False
         progress.progress_state["last_output_file"] = None
         raise e
 
+@router.post("/extract-pressio")
+async def extract_pressio(pdf: UploadFile = File(...)):
+    current_task = progress.progress_state.get("current_task")
+    if progress.progress_state.get("is_running") and current_task and not current_task.done():
+        current_task.cancel()
+        try:
+            await current_task
+        except asyncio.CancelledError:
+            pass
 
-# === Worker process pressio ===
+    content = await pdf.read()
+    # Directement appeler la fonction worker et attendre le résultat
+    result = await extract_pressio_worker(content)
+    # Remise à zéro des flags
+    progress.progress_state["is_running"] = False
+    progress.progress_state["current_task"] = None
+    progress.progress_state["progress_count"] = 0
+    progress.progress_state["total_count"] = 1
+
+    return JSONResponse(result)
+
+
+# PROCESS POST EXTRACT PRESSIOMETRE
+
 async def process_pressio_worker(pdf_bytes, config_data):
+    print("📥 config_data reçu :", config_data)
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
             pages = doc.pages
             total = len(pages)
-            progress.progress_state["progress"] = 0
-            progress.progress_state["total"] = total
+
+            progress.progress_state["progress_count"] = 0
+            progress.progress_state["total_count"] = total
             progress.progress_state["is_running"] = True
 
             mode = config_data['mode']
             depth_config = config_data['config']
-            sondages = config_data['sondages']
+            pressio = config_data['pressio']
             keywords = ["Pf*", "Pl*", "Module"]
 
             final_data = {}
 
             for i, page in enumerate(pages):
                 words = page.extract_words()
-                sondage_name = detect_sondage_name(words) or f"Page {page.page_number}"
-                if sondage_name not in sondages:
-                    progress.progress_state["progress"] = i + 1
+                pressio_name = detect_pressio_name(words) or f"Page {page.page_number}"
+                if pressio_name not in pressio:
+                    progress.progress_state["progress_count"] = i + 1
                     await asyncio.sleep(0)
                     continue
 
@@ -178,7 +202,7 @@ async def process_pressio_worker(pdf_bytes, config_data):
                     pf_final, pl_final = [], []
                     pf_vals = values_by_keyword["Pf*"]
                     if len(pf_vals) % 2 != 0:
-                        progress.progress_state["progress"] = i + 1
+                        progress.progress_state["progress_count"] = i + 1
                         await asyncio.sleep(0)
                         continue
                     for idx in range(len(pf_vals) - 2, -1, -2):
@@ -204,14 +228,14 @@ async def process_pressio_worker(pdf_bytes, config_data):
                 if mode == "global":
                     depths = generate_depths_from_config(depth_config)
                 else:
-                    if sondage_name not in depth_config:
-                        progress.progress_state["progress"] = i + 1
+                    if pressio_name not in depth_config:
+                        progress.progress_state["progress_count"] = i + 1
                         await asyncio.sleep(0)
                         continue
-                    depths = generate_depths_from_config(depth_config[sondage_name])
+                    depths = generate_depths_from_config(depth_config[pressio_name])
 
-                if sondage_name not in final_data:
-                    final_data[sondage_name] = {
+                if pressio_name not in final_data:
+                    final_data[pressio_name] = {
                         "Depth": [],
                         "Pf*": [],
                         "Pl*": [],
@@ -223,17 +247,17 @@ async def process_pressio_worker(pdf_bytes, config_data):
                         }
                     }
 
-                if not final_data[sondage_name]["Depth"]:
-                    final_data[sondage_name]["Depth"] = depths
+                if not final_data[pressio_name]["Depth"]:
+                    final_data[pressio_name]["Depth"] = depths
 
-                final_data[sondage_name]["Pf*"] += pf_list
-                final_data[sondage_name]["Pl*"] += pl_list
-                final_data[sondage_name]["Module"] += em_list
-                final_data[sondage_name]["RedFlags"]["Pf*"] += pf_red
-                final_data[sondage_name]["RedFlags"]["Pl*"] += pl_red
-                final_data[sondage_name]["RedFlags"]["Module"] += em_red
+                final_data[pressio_name]["Pf*"] += pf_list
+                final_data[pressio_name]["Pl*"] += pl_list
+                final_data[pressio_name]["Module"] += em_list
+                final_data[pressio_name]["RedFlags"]["Pf*"] += pf_red
+                final_data[pressio_name]["RedFlags"]["Pl*"] += pl_red
+                final_data[pressio_name]["RedFlags"]["Module"] += em_red
 
-                progress.progress_state["progress"] = i + 1
+                progress.progress_state["progress_count"] = i + 1
                 await asyncio.sleep(0)
 
             progress.progress_state["is_running"] = False
@@ -245,26 +269,6 @@ async def process_pressio_worker(pdf_bytes, config_data):
         progress.progress_state["is_running"] = False
         progress.progress_state["last_output_file"] = None
         raise e
-
-
-
-
-@router.post("/extract-pressio")
-async def extract_pressio(pdf: UploadFile = File(...)):
-    current_task = progress.progress_state.get("current_task")
-    if progress.progress_state.get("is_running") and current_task and not current_task.done():
-        current_task.cancel()
-        try:
-            await current_task
-        except asyncio.CancelledError:
-            pass
-
-    content = await pdf.read()
-    task = asyncio.create_task(extract_pressio_worker(content))
-    progress.progress_state["current_task"] = task
-    progress.progress_state["is_running"] = True
-    result = await task
-    return result
 
 
 @router.post("/process-pressio")
@@ -279,19 +283,26 @@ async def process_pressio(pdf: UploadFile = File(...), config: str = Form(...)):
 
     content = await pdf.read()
     config_data = json.loads(config)
-    task = asyncio.create_task(process_pressio_worker(content, config_data))
-    progress.progress_state["current_task"] = task
-    progress.progress_state["is_running"] = True
-    result = await task
-    return result
+    # Appel direct et attente du worker
+    result = await process_pressio_worker(content, config_data)
+    # Remise à zéro des flags
+    progress.progress_state["is_running"] = False
+    progress.progress_state["current_task"] = None
+    progress.progress_state["progress_count"] = 0
+    progress.progress_state["total_count"] = 1
 
+    return JSONResponse(result)
+
+
+
+# EXPORT PRESSIOMETRE
 
 @router.post("/export-pressio")
 async def export_pressio(validated_data: dict):
     try:
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            for sondage, data in validated_data.items():
+            for pressio, data in validated_data.items():
                 lengths = [
                     len(data.get("Depth", [])),
                     len(data.get("Pf*", [])),
@@ -315,7 +326,7 @@ async def export_pressio(validated_data: dict):
                     "Module": module,
                 })
 
-                safe_sheet_name = re.sub(r'[:\\/*?[\]]', '_', sondage)[:31]
+                safe_sheet_name = re.sub(r'[:\\/*?[\]]', '_', pressio)[:31]
 
                 df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
 
